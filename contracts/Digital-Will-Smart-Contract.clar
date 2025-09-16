@@ -12,9 +12,15 @@
 (define-constant ERR_INVALID_PERCENTAGE (err u110))
 (define-constant ERR_INVALID_STATUS (err u111))
 (define-constant ERR_EVENT_NOT_FOUND (err u112))
+(define-constant ERR_NOT_JOINT_WILL (err u113))
+(define-constant ERR_ALREADY_JOINT_TESTATOR (err u114))
+(define-constant ERR_INSUFFICIENT_VOTES (err u115))
+(define-constant ERR_ALREADY_VOTED (err u116))
+(define-constant ERR_MAX_TESTATORS_REACHED (err u117))
 
 (define-data-var contract-nonce uint u0)
 (define-data-var event-nonce uint u0)
+(define-data-var action-nonce uint u0)
 
 (define-map wills
     { will-id: uint }
@@ -88,6 +94,41 @@
         status-updates: bool,
         emergency-alerts: bool,
         reminder-frequency: uint,
+    }
+)
+
+(define-map joint-wills
+    { will-id: uint }
+    {
+        testators: (list 5 principal),
+        required-votes: uint,
+        is-joint: bool,
+    }
+)
+
+(define-map joint-will-votes
+    {
+        will-id: uint,
+        action: (string-ascii 20),
+        voter: principal,
+    }
+    {
+        vote-cast: bool,
+        timestamp: uint,
+    }
+)
+
+(define-map pending-joint-actions
+    {
+        will-id: uint,
+        action-id: uint,
+    }
+    {
+        action-type: (string-ascii 20),
+        proposer: principal,
+        votes-received: uint,
+        proposed-at: uint,
+        executed: bool,
     }
 )
 
@@ -212,6 +253,45 @@
             )
         )
         u0
+    )
+)
+
+(define-read-only (get-joint-will-info (will-id uint))
+    (map-get? joint-wills { will-id: will-id })
+)
+
+(define-read-only (is-joint-testator
+        (will-id uint)
+        (testator principal)
+    )
+    (match (get-joint-will-info will-id)
+        joint-data (is-some (index-of (get testators joint-data) testator))
+        false
+    )
+)
+
+(define-read-only (get-joint-action-votes
+        (will-id uint)
+        (action-id uint)
+    )
+    (map-get? pending-joint-actions {
+        will-id: will-id,
+        action-id: action-id,
+    })
+)
+
+(define-read-only (has-voted-on-action
+        (will-id uint)
+        (action (string-ascii 20))
+        (voter principal)
+    )
+    (match (map-get? joint-will-votes {
+        will-id: will-id,
+        action: action,
+        voter: voter,
+    })
+        vote-data (get vote-cast vote-data)
+        false
     )
 )
 
@@ -584,6 +664,202 @@
         (asserts! (is-eq tx-sender (get testator will-data)) ERR_NOT_AUTHORIZED)
         (map-set will-status { will-id: will-id }
             (merge current-status { notification-sent: true })
+        )
+        (ok true)
+    )
+)
+
+(define-public (create-joint-will
+        (co-testators (list 4 principal))
+        (heartbeat-period uint)
+        (metadata (string-utf8 256))
+    )
+    (let (
+            (will-id (+ (var-get contract-nonce) u1))
+            (current-block stacks-block-height)
+            (all-testators (unwrap! (as-max-len? (append co-testators tx-sender) u5)
+                ERR_MAX_TESTATORS_REACHED
+            ))
+            (required-votes (+ (/ (len all-testators) u2) u1))
+        )
+        (asserts! (> heartbeat-period u0) ERR_NOT_AUTHORIZED)
+        (asserts! (> (len co-testators) u0) ERR_NOT_AUTHORIZED)
+        (asserts! (< (len co-testators) u5) ERR_MAX_TESTATORS_REACHED)
+        (var-set contract-nonce will-id)
+        (map-set wills { will-id: will-id } {
+            testator: tx-sender,
+            creation-block: current-block,
+            last-heartbeat: current-block,
+            heartbeat-period: heartbeat-period,
+            is-executed: false,
+            is-locked: false,
+            total-value: u0,
+            metadata: metadata,
+        })
+        (map-set joint-wills { will-id: will-id } {
+            testators: all-testators,
+            required-votes: required-votes,
+            is-joint: true,
+        })
+        (unwrap! (update-will-status will-id) (err u999))
+        (unwrap!
+            (log-will-event will-id "joint-will-created" tx-sender
+                u"Joint will successfully created"
+            )
+            (err u999)
+        )
+        (unwrap! (add-will-to-user tx-sender will-id) (err u999))
+        (ok will-id)
+    )
+)
+
+(define-public (propose-joint-action
+        (will-id uint)
+        (action-type (string-ascii 20))
+    )
+    (let (
+            (will-data (unwrap! (get-will-info will-id) ERR_WILL_NOT_EXISTS))
+            (joint-data (unwrap! (get-joint-will-info will-id) ERR_NOT_JOINT_WILL))
+            (action-id (+ (var-get action-nonce) u1))
+        )
+        (asserts! (is-joint-testator will-id tx-sender) ERR_NOT_AUTHORIZED)
+        (asserts! (not (get is-executed will-data)) ERR_WILL_ALREADY_EXECUTED)
+        (var-set action-nonce action-id)
+        (map-set pending-joint-actions {
+            will-id: will-id,
+            action-id: action-id,
+        } {
+            action-type: action-type,
+            proposer: tx-sender,
+            votes-received: u1,
+            proposed-at: stacks-block-height,
+            executed: false,
+        })
+        (map-set joint-will-votes {
+            will-id: will-id,
+            action: action-type,
+            voter: tx-sender,
+        } {
+            vote-cast: true,
+            timestamp: stacks-block-height,
+        })
+        (unwrap!
+            (log-will-event will-id "action-proposed" tx-sender
+                u"Joint will action proposed"
+            )
+            (err u999)
+        )
+        (ok action-id)
+    )
+)
+
+(define-public (vote-on-joint-action
+        (will-id uint)
+        (action-id uint)
+        (action-type (string-ascii 20))
+    )
+    (let (
+            (will-data (unwrap! (get-will-info will-id) ERR_WILL_NOT_EXISTS))
+            (joint-data (unwrap! (get-joint-will-info will-id) ERR_NOT_JOINT_WILL))
+            (action-data (unwrap! (get-joint-action-votes will-id action-id)
+                ERR_EVENT_NOT_FOUND
+            ))
+        )
+        (asserts! (is-joint-testator will-id tx-sender) ERR_NOT_AUTHORIZED)
+        (asserts! (not (get is-executed will-data)) ERR_WILL_ALREADY_EXECUTED)
+        (asserts! (not (get executed action-data)) ERR_WILL_ALREADY_EXECUTED)
+        (asserts! (not (has-voted-on-action will-id action-type tx-sender))
+            ERR_ALREADY_VOTED
+        )
+        (map-set joint-will-votes {
+            will-id: will-id,
+            action: action-type,
+            voter: tx-sender,
+        } {
+            vote-cast: true,
+            timestamp: stacks-block-height,
+        })
+        (map-set pending-joint-actions {
+            will-id: will-id,
+            action-id: action-id,
+        }
+            (merge action-data { votes-received: (+ (get votes-received action-data) u1) })
+        )
+        (unwrap!
+            (log-will-event will-id "vote-cast" tx-sender
+                u"Vote cast on joint action"
+            )
+            (err u999)
+        )
+        (ok true)
+    )
+)
+
+(define-public (execute-joint-will
+        (will-id uint)
+        (action-id uint)
+    )
+    (let (
+            (will-data (unwrap! (get-will-info will-id) ERR_WILL_NOT_EXISTS))
+            (joint-data (unwrap! (get-joint-will-info will-id) ERR_NOT_JOINT_WILL))
+            (action-data (unwrap! (get-joint-action-votes will-id action-id)
+                ERR_EVENT_NOT_FOUND
+            ))
+            (required-votes (get required-votes joint-data))
+            (votes-received (get votes-received action-data))
+        )
+        (asserts! (is-joint-testator will-id tx-sender) ERR_NOT_AUTHORIZED)
+        (asserts! (not (get is-executed will-data)) ERR_WILL_ALREADY_EXECUTED)
+        (asserts! (not (get executed action-data)) ERR_WILL_ALREADY_EXECUTED)
+        (asserts!
+            (or
+                (>= votes-received required-votes)
+                (is-will-ready-for-execution will-id)
+            )
+            ERR_INSUFFICIENT_VOTES
+        )
+        (map-set wills { will-id: will-id }
+            (merge will-data { is-executed: true })
+        )
+        (map-set pending-joint-actions {
+            will-id: will-id,
+            action-id: action-id,
+        }
+            (merge action-data { executed: true })
+        )
+        (map-set will-status { will-id: will-id } {
+            status: "executed",
+            days-until-expiry: u0,
+            risk-level: "none",
+            last-updated: stacks-block-height,
+            notification-sent: false,
+        })
+        (unwrap!
+            (log-will-event will-id "joint-will-executed" tx-sender
+                u"Joint will executed with consensus"
+            )
+            (err u999)
+        )
+        (ok true)
+    )
+)
+
+(define-public (joint-will-heartbeat (will-id uint))
+    (let (
+            (will-data (unwrap! (get-will-info will-id) ERR_WILL_NOT_EXISTS))
+            (joint-data (unwrap! (get-joint-will-info will-id) ERR_NOT_JOINT_WILL))
+        )
+        (asserts! (is-joint-testator will-id tx-sender) ERR_NOT_AUTHORIZED)
+        (asserts! (not (get is-executed will-data)) ERR_WILL_ALREADY_EXECUTED)
+        (map-set wills { will-id: will-id }
+            (merge will-data { last-heartbeat: stacks-block-height })
+        )
+        (unwrap! (update-will-status will-id) (err u999))
+        (unwrap!
+            (log-will-event will-id "joint-heartbeat" tx-sender
+                u"Joint will heartbeat received"
+            )
+            (err u999)
         )
         (ok true)
     )
