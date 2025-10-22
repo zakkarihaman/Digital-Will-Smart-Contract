@@ -1,3 +1,34 @@
+(define-trait sip-010-trait (
+    (transfer
+        (uint principal principal (optional (buff 34)))
+        (response bool uint)
+    )
+    (get-name
+        ()
+        (response (string-ascii 32) uint)
+    )
+    (get-symbol
+        ()
+        (response (string-ascii 32) uint)
+    )
+    (get-decimals
+        ()
+        (response uint uint)
+    )
+    (get-balance
+        (principal)
+        (response uint uint)
+    )
+    (get-total-supply
+        ()
+        (response uint uint)
+    )
+    (get-token-uri
+        ()
+        (response (optional (string-utf8 256)) uint)
+    )
+))
+
 (define-constant CONTRACT_OWNER tx-sender)
 (define-constant ERR_NOT_AUTHORIZED (err u100))
 (define-constant ERR_WILL_NOT_EXISTS (err u101))
@@ -17,6 +48,12 @@
 (define-constant ERR_INSUFFICIENT_VOTES (err u115))
 (define-constant ERR_ALREADY_VOTED (err u116))
 (define-constant ERR_MAX_TESTATORS_REACHED (err u117))
+(define-constant ERR_DOC_EXISTS (err u118))
+(define-constant ERR_DOC_NOT_FOUND (err u119))
+(define-constant ERR_DOC_UNAUTHORIZED (err u120))
+(define-constant ERR_TOKEN_NOT_SUPPORTED (err u121))
+(define-constant ERR_TOKEN_TRANSFER_FAILED (err u122))
+(define-constant ERR_INVALID_TOKEN_AMOUNT (err u123))
 
 (define-data-var contract-nonce uint u0)
 (define-data-var event-nonce uint u0)
@@ -129,6 +166,58 @@
         votes-received: uint,
         proposed-at: uint,
         executed: bool,
+    }
+)
+
+(define-map will-documents
+    {
+        will-id: uint,
+        version: uint,
+    }
+    {
+        hash: (buff 32),
+        uri: (string-utf8 256),
+        added-at: uint,
+        added-by: principal,
+    }
+)
+
+(define-map will-doc-latest
+    { will-id: uint }
+    { latest: uint }
+)
+
+(define-map will-tokens
+    {
+        will-id: uint,
+        token-contract: principal,
+    }
+    {
+        balance: uint,
+        token-symbol: (string-ascii 12),
+        is-active: bool,
+    }
+)
+
+(define-map supported-tokens
+    { token-contract: principal }
+    {
+        token-symbol: (string-ascii 12),
+        decimals: uint,
+        is-enabled: bool,
+    }
+)
+
+(define-map token-distribution-ratios
+    {
+        will-id: uint,
+        beneficiary: principal,
+        token-contract: principal,
+    }
+    {
+        ratio-percentage: uint,
+        custom-amount: uint,
+        distribution-type: (string-ascii 10),
     }
 )
 
@@ -292,6 +381,86 @@
     })
         vote-data (get vote-cast vote-data)
         false
+    )
+)
+
+(define-read-only (get-will-document
+        (will-id uint)
+        (version uint)
+    )
+    (map-get? will-documents {
+        will-id: will-id,
+        version: version,
+    })
+)
+
+(define-read-only (get-latest-document-version (will-id uint))
+    (match (map-get? will-doc-latest { will-id: will-id })
+        v (get latest v)
+        u0
+    )
+)
+
+(define-read-only (get-latest-will-document (will-id uint))
+    (match (map-get? will-doc-latest { will-id: will-id })
+        v (map-get? will-documents {
+            will-id: will-id,
+            version: (get latest v),
+        })
+        none
+    )
+)
+
+(define-read-only (get-will-token-balance
+        (will-id uint)
+        (token-contract principal)
+    )
+    (map-get? will-tokens {
+        will-id: will-id,
+        token-contract: token-contract,
+    })
+)
+
+(define-read-only (is-token-supported (token-contract principal))
+    (match (map-get? supported-tokens { token-contract: token-contract })
+        token-info (get is-enabled token-info)
+        false
+    )
+)
+
+(define-read-only (get-token-distribution
+        (will-id uint)
+        (beneficiary principal)
+        (token-contract principal)
+    )
+    (map-get? token-distribution-ratios {
+        will-id: will-id,
+        beneficiary: beneficiary,
+        token-contract: token-contract,
+    })
+)
+
+(define-read-only (calculate-token-inheritance
+        (will-id uint)
+        (beneficiary principal)
+        (token-contract principal)
+    )
+    (match (get-will-token-balance will-id token-contract)
+        token-data (match (get-token-distribution will-id beneficiary token-contract)
+            distribution-data (let (
+                    (total-balance (get balance token-data))
+                    (distribution-type (get distribution-type distribution-data))
+                )
+                (if (is-eq distribution-type "percentage")
+                    (some (/ (* total-balance (get ratio-percentage distribution-data))
+                        u100
+                    ))
+                    (some (get custom-amount distribution-data))
+                )
+            )
+            none
+        )
+        none
     )
 )
 
@@ -862,5 +1031,200 @@
             (err u999)
         )
         (ok true)
+    )
+)
+
+(define-public (set-will-document
+        (will-id uint)
+        (version uint)
+        (hash (buff 32))
+        (uri (string-utf8 256))
+    )
+    (let (
+            (will-data (unwrap! (get-will-info will-id) ERR_WILL_NOT_EXISTS))
+            (authorized (or (is-eq tx-sender (get testator will-data)) (is-joint-testator will-id tx-sender)))
+        )
+        (asserts! authorized ERR_NOT_AUTHORIZED)
+        (asserts! (not (get is-executed will-data)) ERR_WILL_ALREADY_EXECUTED)
+        (asserts! (> version u0) ERR_INVALID_STATUS)
+        (asserts!
+            (is-none (map-get? will-documents {
+                will-id: will-id,
+                version: version,
+            }))
+            ERR_DOC_EXISTS
+        )
+        (map-set will-documents {
+            will-id: will-id,
+            version: version,
+        } {
+            hash: hash,
+            uri: uri,
+            added-at: stacks-block-height,
+            added-by: tx-sender,
+        })
+        (let ((latest0 (match (map-get? will-doc-latest { will-id: will-id })
+                v (get latest v)
+                u0
+            )))
+            (if (> version latest0)
+                (map-set will-doc-latest { will-id: will-id } { latest: version })
+                true
+            )
+        )
+        (unwrap!
+            (log-will-event will-id "doc-set" tx-sender u"Document recorded")
+            (err u999)
+        )
+        (ok version)
+    )
+)
+
+(define-public (register-supported-token
+        (token-contract principal)
+        (token-symbol (string-ascii 12))
+        (decimals uint)
+    )
+    (begin
+        (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_NOT_AUTHORIZED)
+        (map-set supported-tokens { token-contract: token-contract } {
+            token-symbol: token-symbol,
+            decimals: decimals,
+            is-enabled: true,
+        })
+        (ok true)
+    )
+)
+
+(define-public (deposit-token-to-will
+        (will-id uint)
+        (token-contract <sip-010-trait>)
+        (amount uint)
+        (token-symbol (string-ascii 12))
+    )
+    (let (
+            (will-data (unwrap! (get-will-info will-id) ERR_WILL_NOT_EXISTS))
+            (token-principal (contract-of token-contract))
+            (current-balance (default-to {
+                balance: u0,
+                token-symbol: token-symbol,
+                is-active: true,
+            }
+                (get-will-token-balance will-id token-principal)
+            ))
+        )
+        (asserts! (is-eq tx-sender (get testator will-data)) ERR_NOT_AUTHORIZED)
+        (asserts! (not (get is-executed will-data)) ERR_WILL_ALREADY_EXECUTED)
+        (asserts! (> amount u0) ERR_INVALID_TOKEN_AMOUNT)
+        (asserts! (is-token-supported token-principal) ERR_TOKEN_NOT_SUPPORTED)
+        (match (contract-call? token-contract transfer amount tx-sender
+            (as-contract tx-sender) none
+        )
+            success (begin
+                (map-set will-tokens {
+                    will-id: will-id,
+                    token-contract: token-principal,
+                } {
+                    balance: (+ (get balance current-balance) amount),
+                    token-symbol: token-symbol,
+                    is-active: true,
+                })
+                (unwrap!
+                    (log-will-event will-id "token-deposit" tx-sender
+                        u"Token deposited to will"
+                    )
+                    (err u999)
+                )
+                (ok amount)
+            )
+            error
+            ERR_TOKEN_TRANSFER_FAILED
+        )
+    )
+)
+
+(define-public (set-token-distribution
+        (will-id uint)
+        (beneficiary principal)
+        (token-contract principal)
+        (ratio-percentage uint)
+        (custom-amount uint)
+        (distribution-type (string-ascii 10))
+    )
+    (let ((will-data (unwrap! (get-will-info will-id) ERR_WILL_NOT_EXISTS)))
+        (asserts! (is-eq tx-sender (get testator will-data)) ERR_NOT_AUTHORIZED)
+        (asserts! (not (get is-locked will-data)) ERR_WILL_LOCKED)
+        (asserts! (not (get is-executed will-data)) ERR_WILL_ALREADY_EXECUTED)
+        (asserts! (is-token-supported token-contract) ERR_TOKEN_NOT_SUPPORTED)
+        (asserts! (is-some (get-beneficiary-info will-id beneficiary))
+            ERR_BENEFICIARY_NOT_FOUND
+        )
+        (asserts!
+            (or
+                (and (is-eq distribution-type "percentage") (<= ratio-percentage u100))
+                (and (is-eq distribution-type "fixed") (> custom-amount u0))
+            )
+            ERR_INVALID_PERCENTAGE
+        )
+        (map-set token-distribution-ratios {
+            will-id: will-id,
+            beneficiary: beneficiary,
+            token-contract: token-contract,
+        } {
+            ratio-percentage: ratio-percentage,
+            custom-amount: custom-amount,
+            distribution-type: distribution-type,
+        })
+        (ok true)
+    )
+)
+
+(define-public (claim-token-inheritance
+        (will-id uint)
+        (token-contract <sip-010-trait>)
+    )
+    (let (
+            (will-data (unwrap! (get-will-info will-id) ERR_WILL_NOT_EXISTS))
+            (token-principal (contract-of token-contract))
+            (token-balance (unwrap! (get-will-token-balance will-id token-principal)
+                ERR_TOKEN_NOT_SUPPORTED
+            ))
+            (inheritance-amount (unwrap!
+                (calculate-token-inheritance will-id tx-sender token-principal)
+                ERR_BENEFICIARY_NOT_FOUND
+            ))
+        )
+        (asserts! (get is-executed will-data) ERR_WILL_ALREADY_EXECUTED)
+        (asserts! (get is-active token-balance) ERR_TOKEN_NOT_SUPPORTED)
+        (asserts! (> inheritance-amount u0) ERR_INVALID_TOKEN_AMOUNT)
+        (asserts! (<= inheritance-amount (get balance token-balance))
+            ERR_INSUFFICIENT_BALANCE
+        )
+        (match (as-contract (contract-call? token-contract transfer inheritance-amount tx-sender
+            tx-sender none
+        ))
+            success (begin
+                (map-set will-tokens {
+                    will-id: will-id,
+                    token-contract: token-principal,
+                }
+                    (merge token-balance { balance: (- (get balance token-balance) inheritance-amount) })
+                )
+                (map-delete token-distribution-ratios {
+                    will-id: will-id,
+                    beneficiary: tx-sender,
+                    token-contract: token-principal,
+                })
+                (unwrap!
+                    (log-will-event will-id "token-claimed" tx-sender
+                        u"Token inheritance claimed"
+                    )
+                    (err u999)
+                )
+                (ok inheritance-amount)
+            )
+            error
+            ERR_TOKEN_TRANSFER_FAILED
+        )
     )
 )
