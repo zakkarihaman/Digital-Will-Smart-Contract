@@ -292,6 +292,15 @@
     (map-get? will-status { will-id: will-id })
 )
 
+(define-read-only (get-will-overview (will-id uint))
+    {
+        will: (get-will-info will-id),
+        status: (get-will-status will-id),
+        joint: (get-joint-will-info will-id),
+        latest-document: (get-latest-will-document will-id),
+    }
+)
+
 (define-read-only (get-will-events (event-id uint))
     (map-get? will-events { event-id: event-id })
 )
